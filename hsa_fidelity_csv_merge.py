@@ -10,7 +10,12 @@ enabling improved import and reconciliation back into Monarch Money.
 This script is specifically customized for HSA account transactions exported from Fidelity.
 
 Usage:
-    python3 hsa_fidelity_csv_merge.py --monarch_csv monarch.csv --fidelity_csv fidelity.csv --output_csv output.csv
+    python3 hsa_fidelity_csv_merge.py [-h] --monarch_csv MONARCH_CSV --fidelity_csv FIDELITY_CSV --output_csv OUTPUT_CSV
+
+Expected results:
+    The Merchant column in the Monarch CSV will be updated with the Action column from the Fidelity CSV.
+    Iatue Jul 08 12:00:00 Utc 2025290.55 -> PARTIC CONTR CURRENT PARTICIPANT CUR YR (Cash)
+    Dvfri Jun 20 12:00:00 Utc 20258.11ivv -> DIVIDEND RECEIVED ISHARES CORE S&P 500 ETF (IVV) (Cash)
 
 Maintainer:
     Charles Shi <schrht@gmail.com>
@@ -27,7 +32,7 @@ from datetime import datetime
 import argparse
 
 # Configure logger
-logging.basicConfig(level=logging.DEBUG, format='%(levelname)s: %(message)s', stream=sys.stdout)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s', stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
 def parse_fidelity_date(date_str):
@@ -62,15 +67,19 @@ def extract_symbol_from_original_statement(original_statement):
 
 def parse_fidelity_row(row):
     logger.debug(f"parse_fidelity_row input row: {row}")
+
     # Skip rows that don't have the expected keys
-    if 'Account' not in row or 'Run Date' not in row or 'Amount ($)' not in row:
+    if row.get('Action') is None:
+        logger.debug(f"parse_fidelity_row skipping row: {row}")
         return None
+
     # Only consider HSA account rows
-    if row['Account'] != 'Health Savings Account':
-        return None
+    # if row.get('Account') != 'Health Savings Account':
+    #     return None
+
     # Normalize date and amount
-    run_date = row['Run Date']
-    amount = row['Amount ($)']
+    run_date = row.get('Run Date', '')
+    amount = row.get('Amount ($)', '')
     symbol = row.get('Symbol', '').strip().upper()
     norm_date = parse_fidelity_date(run_date)
     result = {
@@ -87,10 +96,10 @@ def parse_fidelity_row(row):
     return result
 
 def parse_monarch_row(row):
-    logger.debug(f"parse_monarch_row input row: {row}")
     # Monarch: Date,Merchant,Category,Account,Original Statement,Notes,Amount,Tags
-    date = row['Date']
-    amount = row['Amount']
+    logger.debug(f"parse_monarch_row input row: {row}")
+    date = row.get('Date', '')
+    amount = row.get('Amount', '')
     original_statement = row.get('Original Statement', '')
     symbol = extract_symbol_from_original_statement(original_statement)
     norm_date = parse_monarch_date(date)
@@ -125,17 +134,16 @@ def match_entries(monarch_rows, fidelity_rows):
     # Try to match each Monarch row
     for m in monarch_rows:
         key = (m['norm_date'], m['amount'], m['symbol'])
-        logger.debug(f"Monarch key: {key}")
         if key in fidelity_lookup and fidelity_lookup[key]:
             match = fidelity_lookup[key].pop(0)
             matches.append((m, match))
             logger.debug(
                 f"Match found: Monarch entry (Date: {m['date']}, Amount: {m['amount']}, Symbol: {m['symbol']}) "
-                f"<-> Fidelity entry (Date: {match['date']}, Amount: {match['amount']}, Symbol: {match['symbol']}, Description: {match['desc']})"
+                f"<-> Fidelity entry (Date: {match['date']}, Amount: {match['amount']}, Symbol: {match['symbol']}, Action: {match['action']})"
             )
         else:
             unmatched.append(m)
-            logger.warning(f"No match found for Monarch entry (Date: {m['date']}, Amount: {m['amount']}, Symbol: {m['symbol']})")
+            logger.debug(f"Match not found: Monarch entry (Date: {m['date']}, Amount: {m['amount']}, Symbol: {m['symbol']})")
     return matches, unmatched
 
 def skip_blank_lines(f):
@@ -152,10 +160,17 @@ def skip_blank_lines(f):
 
 def main(): 
     parser = argparse.ArgumentParser(description="Merge Monarch and Fidelity CSVs for HSA reconciliation.")
-    parser.add_argument("monarch_csv", help="Path to Monarch CSV file")
-    parser.add_argument("fidelity_csv", help="Path to Fidelity CSV file")
-    parser.add_argument("output_csv", help="Path to output CSV file")
+    parser.add_argument("--monarch_csv", help="Path to Monarch CSV file", required=True)
+    parser.add_argument("--fidelity_csv", help="Path to Fidelity CSV file", required=True)
+    parser.add_argument("--output_csv", help="Path to output CSV file", required=True)
+    parser.add_argument("--debug", action="store_true", help="Enable debug message output")
     args = parser.parse_args()
+
+    # Set logging level based on --debug flag
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
 
     monarch_csv = args.monarch_csv
     fidelity_csv = args.fidelity_csv
@@ -177,10 +192,50 @@ def main():
 
     # Match
     matches, unmatched = match_entries(monarch_rows, fidelity_rows)
+    logger.info(f"Total Fidelity entries: {len(fidelity_rows)}")
     logger.info(f"Total Monarch entries: {len(monarch_rows)}")
     logger.info(f"Matched: {len(matches)}")
     logger.info(f"Unmatched: {len(unmatched)}")
-    # TODO: Update Monarch file with Fidelity info and write output
+
+    # Update Monarch file with Fidelity info and write output
+    # For matched entries, replace Monarch 'Merchant' with Fidelity 'Action'
+    # We'll assume Monarch and Fidelity rows are dicts and Monarch CSV columns are preserved
+
+    # Read Monarch CSV header to preserve column order
+    with open(monarch_csv, newline='') as f:
+        f = skip_blank_lines(f)
+        reader = csv.reader(f)
+        monarch_header = next(reader)
+
+    # Build a mapping from Monarch row (by id) to matched Fidelity row
+    # We'll use the index in monarch_rows as the row id
+    monarch_updates = {}
+    for m, f in matches:
+        monarch_updates[id(m)] = f  # id(m) is unique for each dict
+
+    # Prepare output rows
+    output_rows = []
+    for m in monarch_rows:
+        # Start from the original Monarch row dict to preserve only original columns
+        m_out = m['original'].copy()
+        if id(m) in monarch_updates:
+            fidelity_match = monarch_updates[id(m)]
+            # Replace 'Merchant' in Monarch with 'Action' from Fidelity
+            m_out['Merchant'] = fidelity_match.get('action', m_out.get('Merchant', ''))
+        output_rows.append(m_out)
+
+    # Write output CSV
+    with open(output_csv, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=monarch_header)
+        writer.writeheader()
+        for row in output_rows:
+            writer.writerow(row)
+
+    logger.info(f"Output CSV written to '{output_csv}'")
+    logger.info(f"Output CSV has {len(output_rows)} rows")
+    logger.info(f"Output CSV has {len(matches)} matches")
+    logger.info(f"Output CSV has {len(unmatched)} unmatched")
+    logger.info(f"Please check the output CSV for accuracy!")
 
 if __name__ == "__main__":
     main()
